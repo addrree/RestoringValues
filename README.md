@@ -18,7 +18,8 @@
 
   1. **Клонирование репозитория**: склонируйте код проекта из GitHub:
 ```
-
+git clone https:https://github.com/addrree/RestoringValues.git
+cd RestoringValues
 ```
 
   2. **Установка зависимостей**: установите необходимые пакеты Python. В репозитории присутствует файл [requirements.txt](requirements.txt), выполните команду:
