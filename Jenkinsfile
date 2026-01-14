@@ -12,6 +12,7 @@ pipeline {
   }
 
   stages {
+
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -54,46 +55,46 @@ set -euo pipefail
 
 mkdir -p run_output
 
-echo "==> Tools check (ss, fuser)"
-command -v ss >/dev/null 2>&1 || { echo "ss not found (iproute2). Install it."; exit 1; }
-
-if ! command -v fuser >/dev/null 2>&1; then
-  echo "fuser not found. Trying to install psmisc..."
-  sudo -n apt-get update >/dev/null 2>&1 || true
-  sudo -n apt-get install -y psmisc >/dev/null 2>&1 || true
-fi
-
-command -v fuser >/dev/null 2>&1 || { echo "fuser still not found. Install package 'psmisc' on the node."; exit 1; }
+echo "==> AGENT USER: $(whoami)"
+id || true
 
 echo "==> Cleanup old outputs"
 rm -f Reciever/*.csv Business/*.csv Business/data_out_*.csv Business/data_metrics_*.csv run_output/*.pid run_output/*.log || true
 
-echo "==> Show current listeners (before cleanup)"
+echo "==> Listeners before cleanup"
 ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
 
 kill_by_ports() {
   for p in $PORTS; do
-    # fuser вернёт код !=0 если никто не слушает — это нормально
-    fuser -k ${p}/tcp >/dev/null 2>&1 || true
+    fuser -kv ${p}/tcp >/dev/null 2>&1 || true
   done
 }
 
-ports_free_or_fail() {
+ports_free_once() {
   for p in $PORTS; do
     if ss -lnt | awk '{print $4}' | grep -q ":$p$"; then
-      echo "Port $p is still busy"
       return 1
     fi
   done
   return 0
 }
 
-echo "==> Kill listeners on ports 8092-8095 (personal node mode)"
+ports_free_stable_or_fail() {
+  for t in 1 2 3; do
+    if ! ports_free_once; then
+      return 1
+    fi
+    sleep 0.5
+  done
+  return 0
+}
+
+echo "==> Cleanup ports 8092-8095"
 kill_by_ports
 sleep 1
 
-echo "==> Verify ports are free"
-if ! ports_free_or_fail; then
+echo "==> Verify ports are FREE (stable)"
+if ! ports_free_stable_or_fail; then
   echo "Ports are not free after cleanup. Current listeners:"
   ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
   exit 1
@@ -101,7 +102,6 @@ fi
 
 start_bg() {
   local name="$1"; shift
-  # отдельная сессия => PID == PGID, можно гасить группой kill -- -PID
   setsid nohup "$@" > "run_output/${name}.log" 2>&1 & echo $! > "run_output/${name}.pid"
   echo "Started $name pid=$(cat run_output/${name}.pid)"
 }
@@ -130,6 +130,10 @@ wait_ports() {
   return 1
 }
 
+listener_pids() {
+  ss -lntp | egrep ':8092|:8093|:8094|:8095' | sed -n 's/.*pid=\\([0-9]\\+\\).*/\\1/p' | sort -u || true
+}
+
 fail_with_logs() {
   echo "==> FAILURE diagnostics"
   echo "-- listeners:"
@@ -146,6 +150,20 @@ start_bg simulator python3 Simulator/simulator.py
 echo "==> Wait ports 8092-8095"
 if ! wait_ports; then
   echo "Ports did not become ready."
+  fail_with_logs
+  stop_group simulator
+  kill_by_ports
+  exit 1
+fi
+
+echo "==> Verify listeners belong to THIS build (not foreign process)"
+SIM_GPID="$(cat run_output/simulator.pid)"
+PIDS="$(listener_pids | tr '\\n' ' ')"
+echo "Listeners PIDs: ${PIDS}"
+echo "Simulator group PID: ${SIM_GPID}"
+
+if ! echo "${PIDS}" | tr ' ' '\\n' | grep -q "^${SIM_GPID}$"; then
+  echo "Foreign listener detected: ports are not owned by this simulator process group."
   fail_with_logs
   stop_group simulator
   kill_by_ports
@@ -197,7 +215,7 @@ kill_by_ports
 sleep 1
 
 echo "==> Verify ports are free after stopping"
-if ! ports_free_or_fail; then
+if ! ports_free_stable_or_fail; then
   echo "Ports are still busy after stopping. Current listeners:"
   ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
   exit 1
@@ -205,21 +223,12 @@ fi
 '''
       }
     }
-
-    stage('Archive artifacts') {
-      steps {
-        sh '''#!/usr/bin/env bash
-          set -eux
-          ls -la dist || true
-          ls -la run_output || true
-        '''
-        archiveArtifacts artifacts: 'dist/*, run_output/*', fingerprint: true
-      }
-    }
   }
 
   post {
     always {
+      // Архивируем ВСЕГДА, даже если smoke stage упал
+      archiveArtifacts artifacts: 'dist/*, run_output/*', fingerprint: true, allowEmptyArchive: true
       cleanWs()
     }
   }
