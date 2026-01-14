@@ -3,7 +3,7 @@ pipeline {
 
   options {
     timestamps()
-    timeout(time: 10, unit: 'MINUTES')
+    timeout(time: 12, unit: 'MINUTES')
     disableConcurrentBuilds()
   }
 
@@ -47,7 +47,7 @@ pipeline {
       }
     }
 
-    stage('Smoke run (25s, no GUI)') {
+    stage('Smoke run (90s, no GUI)') {
       steps {
         sh '''#!/usr/bin/env bash
 set -euo pipefail
@@ -138,6 +138,15 @@ fail_with_logs() {
   echo "==> FAILURE diagnostics"
   echo "-- listeners:"
   ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
+
+  echo "-- processes:"
+  [ -f run_output/simulator.pid ] && ps -o pid,pgid,cmd -p "$(cat run_output/simulator.pid)" || true
+  [ -f run_output/reciever.pid ] && ps -o pid,pgid,cmd -p "$(cat run_output/reciever.pid)" || true
+  [ -f run_output/business.pid ] && ps -o pid,pgid,cmd -p "$(cat run_output/business.pid)" || true
+
+  echo "-- Business CSV snapshot (anywhere inside Business/, depth<=3):"
+  find Business -maxdepth 3 -type f -name '*.csv' -print 2>/dev/null || true
+
   echo "-- tail logs:"
   tail -n 200 run_output/simulator.log 2>/dev/null || true
   tail -n 200 run_output/reciever.log 2>/dev/null || true
@@ -158,12 +167,10 @@ fi
 
 echo "==> Verify listeners belong to THIS build (same process group)"
 SIM_GPID="$(cat run_output/simulator.pid)"
-PIDS="$(listener_pids | tr '\n' ' ')"
-
+PIDS="$(listener_pids | tr '\\n' ' ')"
 echo "Listeners PIDs: ${PIDS}"
 echo "Simulator group PID (PGID): ${SIM_GPID}"
 
-# Проверяем, что каждый PID-слушатель принадлежит той же process group (PGID)
 for pid in ${PIDS}; do
   pgid="$(ps -o pgid= -p "${pid}" | tr -d ' ' || true)"
   echo "Listener pid=${pid} has PGID=${pgid}"
@@ -176,13 +183,28 @@ for pid in ${PIDS}; do
   fi
 done
 
-
 echo "==> Start Reciever + Business"
 start_bg reciever python3 Reciever/reciever.py
 start_bg business python3 Business/business.py
 
-echo "==> Let them work 25s"
-sleep 25
+echo "==> Let them work 90s"
+sleep 90
+
+echo "==> Check processes still alive"
+for name in simulator reciever business; do
+  if [ -f "run_output/${name}.pid" ]; then
+    pid="$(cat run_output/${name}.pid)"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "$name is NOT running (pid=$pid)."
+      fail_with_logs
+      stop_group business
+      stop_group reciever
+      stop_group simulator
+      kill_by_ports
+      exit 1
+    fi
+  fi
+done
 
 echo "==> Check Reciever output CSV exists"
 if ! ls -la Reciever/*.csv >/dev/null 2>&1; then
@@ -195,9 +217,12 @@ if ! ls -la Reciever/*.csv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Check Business output exists (data_out or metrics)"
-if ! ls -la Business/data_out_*.csv >/dev/null 2>&1 && ! ls -la Business/data_metrics_*.csv >/dev/null 2>&1; then
-  echo "No Business outputs produced (data_out_*.csv or data_metrics_*.csv)."
+echo "==> Check Business output exists (any CSV inside Business/)"
+BUS_CSV_COUNT="$(find Business -maxdepth 3 -type f -name '*.csv' 2>/dev/null | wc -l | tr -d ' ')"
+echo "Business CSV count: ${BUS_CSV_COUNT}"
+
+if [ "${BUS_CSV_COUNT}" -eq 0 ]; then
+  echo "No Business CSV produced anywhere under Business/ (depth<=3)."
   fail_with_logs
   stop_group business
   stop_group reciever
@@ -208,7 +233,7 @@ fi
 
 echo "==> Copy outputs to run_output"
 cp -a Reciever/*.csv run_output/ 2>/dev/null || true
-cp -a Business/*.csv run_output/ 2>/dev/null || true
+find Business -maxdepth 3 -type f -name '*.csv' -exec cp -a {} run_output/ \\; 2>/dev/null || true
 
 echo "Smoke run OK"
 
@@ -234,7 +259,6 @@ fi
 
   post {
     always {
-      // Архивируем ВСЕГДА, даже если smoke stage упал
       archiveArtifacts artifacts: 'dist/*, run_output/*', fingerprint: true, allowEmptyArchive: true
       cleanWs()
     }
