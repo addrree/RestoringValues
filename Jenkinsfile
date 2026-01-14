@@ -31,46 +31,69 @@ pipeline {
     }
 
     stage('Smoke run (headless, no GUI)') {
-    steps {
+      steps {
         sh '''#!/usr/bin/env bash
     set -euo pipefail
 
-    VENV=".venv/bin/activate"
-    . "$VENV"
+    . .venv/bin/activate
 
-    # 1) стартуем reciever (он должен поднять WS/порты)
-    nohup python3 Reciever/reciever.py > reciever.log 2>&1 & echo $! > reciever.pid
+    # чтобы Simulator подключался к локальному ws-server гарантированно
+    export WEBSOCKET_HOST=127.0.0.1
 
-    # 2) ждём, пока порт начнёт слушать
-    echo "Waiting for 8092 to be ready..."
-    for i in $(seq 1 30); do
-    if ss -lnt | awk '{print $4}' | grep -q ":8092$"; then
-        echo "8092 is listening"
+    # на всякий — чистим старые csv от прошлых запусков
+    rm -f Reciever/*.csv Business/*.csv Business/data_out_*.csv Business/data_metrics_*.csv || true
+
+    # 1) стартуем Simulator (он поднимает server_web.py и слушает 8092-8095)
+    nohup python3 Simulator/simulator.py > simulator.log 2>&1 & echo $! > simulator.pid
+
+    # 2) ждём, пока порты 8092-8095 начнут слушаться
+    echo "Waiting for WS ports 8092-8095 to be ready..."
+    for i in $(seq 1 40); do
+    ok=0
+    for p in 8092 8093 8094 8095; do
+        if ss -lnt | awk '{print $4}' | grep -q ":$p$"; then
+        ok=$((ok+1))
+        fi
+    done
+    if [ "$ok" -eq 4 ]; then
+        echo "All ports are listening"
         break
     fi
-    sleep 1
+    sleep 0.5
     done
 
-    if ! ss -lnt | awk '{print $4}' | grep -q ":8092$"; then
-    echo "Port 8092 is still not listening. Logs:"
-    tail -n 200 reciever.log || true
-    exit 1
+    for p in 8092 8093 8094 8095; do
+    if ! ss -lnt | awk '{print $4}' | grep -q ":$p$"; then
+        echo "Port $p is NOT listening. Simulator logs:"
+        tail -n 200 simulator.log || true
+        kill $(cat simulator.pid) 2>/dev/null || true
+        exit 1
     fi
+    done
 
-    # 3) запускаем simulator и business
-    nohup python3 Simulator/simulator.py > simulator.log 2>&1 & echo $! > simulator.pid
-    nohup python3 Business/business.py   > business.log 2>&1 & echo $! > business.pid
+    # 3) стартуем Reciever и Business (они клиенты/обработчики)
+    nohup python3 Reciever/reciever.py > reciever.log 2>&1 & echo $! > reciever.pid
+    nohup python3 Business/business.py > business.log 2>&1 & echo $! > business.pid
 
     # 4) ждём чуть-чуть
     sleep 25
 
-    # 5) проверка: должны появиться csv от reciever
-    ls -la Reciever/*.csv || (echo "No CSV produced. Logs:"; tail -n 200 reciever.log; tail -n 200 simulator.log; exit 1)
-
-    # 6) стопаем всё
-    kill $(cat simulator.pid) 2>/dev/null || true
+    # 5) проверка: должны появиться CSV от Reciever
+    ls -la Reciever/*.csv >/dev/null 2>&1 || {
+    echo "No CSV produced by Reciever. Logs:"
+    tail -n 200 reciever.log || true
+    tail -n 200 simulator.log || true
+    tail -n 200 business.log || true
     kill $(cat business.pid) 2>/dev/null || true
     kill $(cat reciever.pid) 2>/dev/null || true
+    kill $(cat simulator.pid) 2>/dev/null || true
+    exit 1
+    }
+
+    # 6) стопаем всё
+    kill $(cat business.pid) 2>/dev/null || true
+    kill $(cat reciever.pid) 2>/dev/null || true
+    kill $(cat simulator.pid) 2>/dev/null || true
 
     echo "Smoke run OK"
     '''

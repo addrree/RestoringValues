@@ -6,6 +6,7 @@ import subprocess
 import websockets, os, socket
 import asyncio
 import random
+import time
 
 files = ["PowerConsumption1.csv", "energydata_complete.csv"]
 ports = [8092, 8093, 8094, 8095]
@@ -150,6 +151,27 @@ if __name__ == "__main__":
     print(sys.path)
     server_app = os.path.join(os.path.dirname(__file__), 'server_web.py')
     subprocess.Popen([sys.executable, server_app, f"{ports[0]}-{ports[1]}-{ports[2]}-{ports[3]}"])
+    
+def wait_port(host: str, port: int, timeout: int = 15) -> None:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.2)
+    raise RuntimeError(f"WS server not ready on {host}:{port} after {timeout}s")
+
+if __name__ == "__main__":
+    # чтобы не зависеть от hostname Jenkins-ноды
+    os.environ.setdefault("WEBSOCKET_HOST", "127.0.0.1")
+
+    server_app = os.path.join(os.path.dirname(__file__), 'server_web.py')
+    subprocess.Popen([sys.executable, server_app, f"{ports[0]}-{ports[1]}-{ports[2]}-{ports[3]}"])
+
+    host = os.getenv("WEBSOCKET_HOST", "127.0.0.1")
+    for p in ports:
+        wait_port(host, p, timeout=15)
 
     loop = asyncio.get_event_loop()
 
