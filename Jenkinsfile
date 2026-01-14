@@ -156,19 +156,26 @@ if ! wait_ports; then
   exit 1
 fi
 
-echo "==> Verify listeners belong to THIS build (not foreign process)"
+echo "==> Verify listeners belong to THIS build (same process group)"
 SIM_GPID="$(cat run_output/simulator.pid)"
-PIDS="$(listener_pids | tr '\\n' ' ')"
-echo "Listeners PIDs: ${PIDS}"
-echo "Simulator group PID: ${SIM_GPID}"
+PIDS="$(listener_pids | tr '\n' ' ')"
 
-if ! echo "${PIDS}" | tr ' ' '\\n' | grep -q "^${SIM_GPID}$"; then
-  echo "Foreign listener detected: ports are not owned by this simulator process group."
-  fail_with_logs
-  stop_group simulator
-  kill_by_ports
-  exit 1
-fi
+echo "Listeners PIDs: ${PIDS}"
+echo "Simulator group PID (PGID): ${SIM_GPID}"
+
+# Проверяем, что каждый PID-слушатель принадлежит той же process group (PGID)
+for pid in ${PIDS}; do
+  pgid="$(ps -o pgid= -p "${pid}" | tr -d ' ' || true)"
+  echo "Listener pid=${pid} has PGID=${pgid}"
+  if [ -z "${pgid}" ] || [ "${pgid}" != "${SIM_GPID}" ]; then
+    echo "Foreign listener detected: pid=${pid} is not in simulator PGID=${SIM_GPID}"
+    fail_with_logs
+    stop_group simulator
+    kill_by_ports
+    exit 1
+  fi
+done
+
 
 echo "==> Start Reciever + Business"
 start_bg reciever python3 Reciever/reciever.py
