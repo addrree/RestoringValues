@@ -34,9 +34,17 @@ pipeline {
       steps {
         sh '''#!/usr/bin/env bash
     set -euo pipefail
-
+    
     . .venv/bin/activate
+    echo "==> Ports before start"
+    ss -lntp | egrep ':8092|:8093|:8094|:8095|:8050|:8051' || true
 
+    # если хочешь строго валить билд когда занято:
+    if ss -lntp | awk '{print $4}' | egrep -q ':(8092|8093|8094|8095|8050|8051)$'; then
+    echo "Some required port is already in use. Who?"
+    sudo ss -lntp | egrep ':8092|:8093|:8094|:8095|:8050|:8051' || true
+    exit 1
+    fi
     # чтобы Simulator подключался к локальному ws-server гарантированно
     export WEBSOCKET_HOST=127.0.0.1
 
