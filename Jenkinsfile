@@ -53,10 +53,55 @@ set -euo pipefail
 . .venv_test/bin/activate
 
 mkdir -p run_output
-rm -f Reciever/*.csv Business/*.csv Business/data_out_*.csv Business/data_metrics_*.csv || true
+
+echo "==> Tools check (ss, fuser)"
+command -v ss >/dev/null 2>&1 || { echo "ss not found (iproute2). Install it."; exit 1; }
+
+if ! command -v fuser >/dev/null 2>&1; then
+  echo "fuser not found. Trying to install psmisc..."
+  sudo -n apt-get update >/dev/null 2>&1 || true
+  sudo -n apt-get install -y psmisc >/dev/null 2>&1 || true
+fi
+
+command -v fuser >/dev/null 2>&1 || { echo "fuser still not found. Install package 'psmisc' on the node."; exit 1; }
+
+echo "==> Cleanup old outputs"
+rm -f Reciever/*.csv Business/*.csv Business/data_out_*.csv Business/data_metrics_*.csv run_output/*.pid run_output/*.log || true
+
+echo "==> Show current listeners (before cleanup)"
+ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
+
+kill_by_ports() {
+  for p in $PORTS; do
+    # fuser вернёт код !=0 если никто не слушает — это нормально
+    fuser -k ${p}/tcp >/dev/null 2>&1 || true
+  done
+}
+
+ports_free_or_fail() {
+  for p in $PORTS; do
+    if ss -lnt | awk '{print $4}' | grep -q ":$p$"; then
+      echo "Port $p is still busy"
+      return 1
+    fi
+  done
+  return 0
+}
+
+echo "==> Kill listeners on ports 8092-8095 (personal node mode)"
+kill_by_ports
+sleep 1
+
+echo "==> Verify ports are free"
+if ! ports_free_or_fail; then
+  echo "Ports are not free after cleanup. Current listeners:"
+  ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
+  exit 1
+fi
 
 start_bg() {
   local name="$1"; shift
+  # отдельная сессия => PID == PGID, можно гасить группой kill -- -PID
   setsid nohup "$@" > "run_output/${name}.log" 2>&1 & echo $! > "run_output/${name}.pid"
   echo "Started $name pid=$(cat run_output/${name}.pid)"
 }
@@ -85,44 +130,89 @@ wait_ports() {
   return 1
 }
 
-# Стартуем как раньше (файлами) — это самый совместимый способ
+fail_with_logs() {
+  echo "==> FAILURE diagnostics"
+  echo "-- listeners:"
+  ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
+  echo "-- tail logs:"
+  tail -n 200 run_output/simulator.log 2>/dev/null || true
+  tail -n 200 run_output/reciever.log 2>/dev/null || true
+  tail -n 200 run_output/business.log 2>/dev/null || true
+}
+
+echo "==> Start Simulator"
 start_bg simulator python3 Simulator/simulator.py
 
+echo "==> Wait ports 8092-8095"
 if ! wait_ports; then
-  echo "Ports not ready. Logs:"
-  tail -n 200 run_output/simulator.log || true
+  echo "Ports did not become ready."
+  fail_with_logs
   stop_group simulator
+  kill_by_ports
   exit 1
 fi
 
+echo "==> Start Reciever + Business"
 start_bg reciever python3 Reciever/reciever.py
 start_bg business python3 Business/business.py
 
+echo "==> Let them work 25s"
 sleep 25
 
+echo "==> Check Reciever output CSV exists"
 if ! ls -la Reciever/*.csv >/dev/null 2>&1; then
-  echo "No CSV produced. Logs:"
-  tail -n 200 run_output/reciever.log || true
-  tail -n 200 run_output/simulator.log || true
-  tail -n 200 run_output/business.log || true
+  echo "No Reciever CSV produced."
+  fail_with_logs
   stop_group business
   stop_group reciever
   stop_group simulator
+  kill_by_ports
   exit 1
 fi
 
+echo "==> Check Business output exists (data_out or metrics)"
+if ! ls -la Business/data_out_*.csv >/dev/null 2>&1 && ! ls -la Business/data_metrics_*.csv >/dev/null 2>&1; then
+  echo "No Business outputs produced (data_out_*.csv or data_metrics_*.csv)."
+  fail_with_logs
+  stop_group business
+  stop_group reciever
+  stop_group simulator
+  kill_by_ports
+  exit 1
+fi
+
+echo "==> Copy outputs to run_output"
 cp -a Reciever/*.csv run_output/ 2>/dev/null || true
 cp -a Business/*.csv run_output/ 2>/dev/null || true
 
+echo "Smoke run OK"
+
+echo "==> Stop processes"
 stop_group business
 stop_group reciever
 stop_group simulator
+
+echo "==> Final port cleanup"
+kill_by_ports
+sleep 1
+
+echo "==> Verify ports are free after stopping"
+if ! ports_free_or_fail; then
+  echo "Ports are still busy after stopping. Current listeners:"
+  ss -lntp | egrep ':8092|:8093|:8094|:8095' || true
+  exit 1
+fi
 '''
       }
     }
 
     stage('Archive artifacts') {
       steps {
+        sh '''#!/usr/bin/env bash
+          set -eux
+          ls -la dist || true
+          ls -la run_output || true
+        '''
         archiveArtifacts artifacts: 'dist/*, run_output/*', fingerprint: true
       }
     }
