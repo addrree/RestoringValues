@@ -3,117 +3,88 @@ pipeline {
 
   options {
     timestamps()
-    disableConcurrentBuilds()
     timeout(time: 10, unit: 'MINUTES')
-    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
-  }
-
-  parameters {
-    choice(name: 'MODE', choices: ['build', 'deploy'], description: 'build = собрать артефакт, deploy = задеплоить на VM')
-    string(name: 'REPO_URL', defaultValue: 'https://github.com/addrree/RestoringValues', description: 'Git repo')
-    string(name: 'BRANCH', defaultValue: 'main', description: 'Branch')
-    string(name: 'PYTHON', defaultValue: 'python3', description: 'Python executable')
-    string(name: 'ARTIFACT_NAME', defaultValue: 'restoringvalues.tar.gz', description: 'Name of packaged artifact')
-  }
-
-  environment {
-    VENV_DIR = ".venv"
   }
 
   stages {
     stage('Checkout') {
-      steps {
-        deleteDir()
-        git branch: params.BRANCH, url: params.REPO_URL
-      }
-    }
-
-    stage('System info (safe)') {
-      steps {
-        sh '''
-          set -e
-          echo "== whoami =="; whoami
-          echo "== pwd =="; pwd
-          echo "== df -h =="; df -h .
-          echo "== free -h =="; free -h || true
-          echo "== uname -a =="; uname -a
-          echo "== python =="; ${PYTHON} --version
-        '''
-      }
+      steps { checkout scm }
     }
 
     stage('Create venv + install deps') {
-      when { expression { params.MODE == 'build' } }
       steps {
-        sh '''
+        sh '''#!/bin/bash
           set -e
-          rm -rf "${VENV_DIR}"
-          ${PYTHON} -m venv "${VENV_DIR}"
-          . "${VENV_DIR}/bin/activate"
-          python -m pip install --upgrade pip wheel setuptools
-
-          # If requirements exist – install them; otherwise skip.
+          python3 -V
+          rm -rf .venv
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -U pip wheel
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          elif [ -f pyproject.toml ]; then
-            # fallback (won't fail if it's not a package)
-            pip install .
+          else
+            echo "requirements.txt not found - add it please"
+            exit 1
           fi
         '''
       }
     }
 
-    stage('Smoke check (safe)') {
-      when { expression { params.MODE == 'build' } }
+    stage('Smoke run (headless, no GUI)') {
       steps {
-        sh '''
+        sh '''#!/bin/bash
           set -e
-          . "${VENV_DIR}/bin/activate"
+          . .venv/bin/activate
 
-          # Try import project modules if possible (won't fail hard if structure unknown)
-          python - <<'PY' || true
-import sys, os
-print("Python:", sys.version)
-print("CWD:", os.getcwd())
-print("Top-level files:", os.listdir(".")[:30])
-PY
+          # clean previous outputs (optional)
+          rm -f Reciever/*.csv Business/*.csv || true
 
-          # If there are pytest tests – run quick
-          if [ -d tests ] || [ -f pytest.ini ] || [ -f pyproject.toml ]; then
-            python -m pip install -q pytest || true
-            pytest -q || true
-          fi
+          # start 3 services in background
+          python3 Simulator/simulator.py > simulator.log 2>&1 &
+          SIM_PID=$!
+          python3 Reciever/reciever.py > reciever.log 2>&1 &
+          REC_PID=$!
+          python3 Business/business.py > business.log 2>&1 &
+          BUS_PID=$!
+
+          # let it work a bit
+          sleep 25
+
+          echo "==> Check processes"
+          ps -p $SIM_PID -o pid= >/dev/null || (echo "simulator died"; tail -n 50 simulator.log; exit 1)
+          ps -p $REC_PID -o pid= >/dev/null || (echo "reciever died"; tail -n 50 reciever.log; exit 1)
+          ps -p $BUS_PID -o pid= >/dev/null || (echo "business died"; tail -n 50 business.log; exit 1)
+
+          echo "==> Check outputs (CSV exist)"
+          ls -la Reciever/*.csv >/dev/null 2>&1 || (echo "No receiver CSV"; ls -la Reciever || true; exit 1)
+          ls -la Business/*.csv >/dev/null 2>&1 || (echo "No business CSV"; ls -la Business || true; exit 1)
+
+          echo "==> Stop services"
+          kill $SIM_PID $REC_PID $BUS_PID || true
+          sleep 2
         '''
       }
     }
 
     stage('Pack artifact') {
-      when { expression { params.MODE == 'build' } }
       steps {
-        sh '''
+        sh '''#!/bin/bash
           set -e
-          rm -f "${ARTIFACT_NAME}"
-
-          # pack repo WITHOUT venv and git history
-          tar --exclude=".git" --exclude="${VENV_DIR}" --exclude="__pycache__" --exclude="*.pyc" \
-              --exclude=".pytest_cache" --exclude=".mypy_cache" --exclude=".ruff_cache" \
-              -czf "${ARTIFACT_NAME}" .
-          ls -lah "${ARTIFACT_NAME}"
+          # pack code + requirements + logs + example outputs
+          tar -czf artifact-restoringvalues.tgz \
+            Simulator Reciever Business GUI \
+            requirements.txt \
+            *.log || true
         '''
-        archiveArtifacts artifacts: "${params.ARTIFACT_NAME}", fingerprint: true
-      }
-    }
-
-    stage('Clean workspace') {
-      steps {
-        deleteDir()
+        archiveArtifacts artifacts: 'artifact-restoringvalues.tgz, *.log', fingerprint: true
       }
     }
   }
 
   post {
-    success { echo "Pipeline SUCCESS" }
-    failure { echo "Pipeline FAILED" }
-    always  { echo "Done." }
+    always {
+      echo "Done."
+      cleanWs()
+    }
   }
 }
